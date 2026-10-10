@@ -234,6 +234,7 @@ void set_font_options(cairo_font_options_t *options)
 
 - (void) dealloc
 {
+  RELEASE(_fallbacks);
   if (_scaled)
     {
       cairo_scaled_font_destroy(_scaled);
@@ -241,7 +242,7 @@ void set_font_options(cairo_font_options_t *options)
   [super dealloc];
 }
 
-- (BOOL) glyphIsEncoded: (NSGlyph)glyph
+- (BOOL) _ownsGlyph: (NSGlyph)glyph
 {
   BOOL val = NO;
 
@@ -256,6 +257,92 @@ void set_font_options(cairo_font_options_t *options)
       cairo_ft_scaled_font_unlock_face(_scaled);
     }
   return val;
+}
+
+/* Fonts tried, in order, for a character the requested font lacks.  GSFontFallbacks (user default, array of
+ * font names) replaces the list.  FCFontEnumerator looks names up
+ * exactly, so an unknown name just yields no face.  The defaults are the
+ * fonts the image ships (iokit build_fonts.sh). */
+static NSArray *
+_fallback_names(void)
+{
+  NSArray *a = [[NSUserDefaults standardUserDefaults]
+                 arrayForKey: @"GSFontFallbacks"];
+
+  if (a)
+    return a;
+  return [NSArray arrayWithObjects:
+    @"DejaVuSans", @"NotoSansCJKsc-Regular", @"NotoSansCJKjp-Regular",
+    @"NotoSansCJKkr-Regular", @"NotoEmoji-Regular", @"Unifont", nil];
+}
+
+- (CairoFontInfo *) _fallbackForGlyph: (NSGlyph)glyph
+{
+  NSUInteger i, n;
+  NSArray *names;
+
+  if (_isFallback)
+    return nil;
+
+  if (!_fallbacks)
+    {
+      /* One face per name, NSNull for the ones the system does not have.
+       * Built once per font. */
+      names = _fallback_names();
+      _fallbacks = [[NSMutableArray alloc] init];
+      for (i = 0; i < [names count]; i++)
+        {
+          NSString *name = [names objectAtIndex: i];
+          CairoFontInfo *f = [[CairoFontInfo alloc] initWithFontName: name
+                                                             matrix: matrix
+                                                         screenFont: _screenFont];
+
+          if (f)
+            {
+              f->_isFallback = YES;
+              [_fallbacks addObject: f];
+              RELEASE(f);
+            }
+          else
+            {
+              [_fallbacks addObject: [NSNull null]];
+            }
+        }
+    }
+
+  n = [_fallbacks count];
+  for (i = 0; i < n; i++)
+    {
+      CairoFontInfo *f = [_fallbacks objectAtIndex: i];
+
+      if ((id)f != [NSNull null] && [f _ownsGlyph: glyph])
+        {
+          return f;
+        }
+    }
+  return nil;
+}
+
+- (BOOL) glyphIsEncoded: (NSGlyph)glyph
+{
+  if ([self _ownsGlyph: glyph])
+    return YES;
+  if (glyph < 0x80)
+    return NO;
+  return [self _fallbackForGlyph: glyph] != nil;
+}
+
+/* The scaled font that draws this glyph: ours, else a fallback's. */
+- (cairo_scaled_font_t *) _scaledForGlyph: (NSGlyph)glyph
+{
+  if (glyph >= 0x80 && ![self _ownsGlyph: glyph])
+    {
+      CairoFontInfo *f = [self _fallbackForGlyph: glyph];
+
+      if (f)
+        return f->_scaled;
+    }
+  return _scaled;
 }
 
 - (NSGlyph) glyphWithName: (NSString *)glyphName
@@ -277,27 +364,61 @@ void set_font_options(cairo_font_options_t *options)
   return val;
 }
 
+/* Glyphs are Unicode code points here, so they can lie above U+FFFF; a
+ * unichar buffer would truncate them to 16 bits.  Encode one as UTF-8,
+ * return the byte count (0 for an invalid code point). */
+static int
+_utf8_for_NSGlyph(NSGlyph g, char *out)
+{
+  if (g < 0x80)
+    {
+      out[0] = g;
+      return 1;
+    }
+  if (g < 0x800)
+    {
+      out[0] = 0xc0 | (g >> 6);
+      out[1] = 0x80 | (g & 0x3f);
+      return 2;
+    }
+  if (g >= 0xd800 && g <= 0xdfff)
+    return 0;
+  if (g < 0x10000)
+    {
+      out[0] = 0xe0 | (g >> 12);
+      out[1] = 0x80 | ((g >> 6) & 0x3f);
+      out[2] = 0x80 | (g & 0x3f);
+      return 3;
+    }
+  if (g <= 0x10ffff)
+    {
+      out[0] = 0xf0 | (g >> 18);
+      out[1] = 0x80 | ((g >> 12) & 0x3f);
+      out[2] = 0x80 | ((g >> 6) & 0x3f);
+      out[3] = 0x80 | (g & 0x3f);
+      return 4;
+    }
+  return 0;
+}
+
+/* UTF-8 for count glyphs; str must hold 4 * count + 1 bytes. */
+static void
+_utf8_for_NSGlyphs(const NSGlyph *glyphs, int count, char *str)
+{
+  int i, n = 0;
+
+  for (i = 0; i < count; i++)
+    n += _utf8_for_NSGlyph(glyphs[i], str + n);
+  str[n] = 0;
+}
+
 static
 BOOL _cairo_extents_for_NSGlyph(cairo_scaled_font_t *scaled_font, NSGlyph glyph,
                                 cairo_text_extents_t *ctext)
 {
-  unichar ustr[2];
-  char str[4];
-  unsigned char *b;
-  unsigned int size = 4;
-  int length = 1;
+  char str[5];
 
-  ustr[0] = glyph;
-  ustr[1] = 0;
-
-  b = (unsigned char *)str;
-  if (!GSFromUnicode(&b, &size, ustr, length, 
-                     NSUTF8StringEncoding, NULL, GSUniTerminate))
-    {
-      NSLog(@"Conversion failed for %@", 
-            [NSString stringWithCharacters: ustr length: length]);
-      return NO;
-    }
+  _utf8_for_NSGlyphs(&glyph, 1, str);
 
   cairo_scaled_font_text_extents(scaled_font, str, ctext);
   return cairo_scaled_font_status(scaled_font) == CAIRO_STATUS_SUCCESS;
@@ -316,7 +437,7 @@ BOOL _cairo_extents_for_NSGlyph(cairo_scaled_font_t *scaled_font, NSGlyph glyph,
           return _cachedSizes[entry];
         }
       
-      if (_cairo_extents_for_NSGlyph(_scaled, glyph, &ctext))
+      if (_cairo_extents_for_NSGlyph([self _scaledForGlyph: glyph], glyph, &ctext))
         {
           _cachedGlyphs[entry] = glyph;
           _cachedSizes[entry] = NSMakeSize(ctext.x_advance, ctext.y_advance);
@@ -326,7 +447,7 @@ BOOL _cairo_extents_for_NSGlyph(cairo_scaled_font_t *scaled_font, NSGlyph glyph,
     }
   else
     {
-      if (_cairo_extents_for_NSGlyph(_scaled, glyph, &ctext))
+      if (_cairo_extents_for_NSGlyph([self _scaledForGlyph: glyph], glyph, &ctext))
         {
           return NSMakeSize(ctext.x_advance, ctext.y_advance);
         }
@@ -339,7 +460,7 @@ BOOL _cairo_extents_for_NSGlyph(cairo_scaled_font_t *scaled_font, NSGlyph glyph,
 {
   cairo_text_extents_t ctext;
 
-  if (_cairo_extents_for_NSGlyph(_scaled, glyph, &ctext))
+  if (_cairo_extents_for_NSGlyph([self _scaledForGlyph: glyph], glyph, &ctext))
     {
       return NSMakeRect(ctext.x_bearing, ctext.y_bearing,
                         ctext.width, ctext.height);
@@ -383,27 +504,11 @@ BOOL _cairo_extents_for_NSGlyph(cairo_scaled_font_t *scaled_font, NSGlyph glyph,
   int iy = 400;
   unsigned char *cdata;
   int i;
-  unichar ustr[length+1];
-  char str[3*length+1];
-  unsigned char *b;
-  unsigned int size = 3*length+1;
+  char str[4*length+1];
   cairo_status_t status;
   cairo_matrix_t font_matrix;
 
-  for (i = 0; i < length; i++)
-    {
-      ustr[i] = glyphs[i];
-    }
-  ustr[length] = 0;
-
-  b = (unsigned char *)str;
-  if (!GSFromUnicode(&b, &size, ustr, length, 
-                     NSUTF8StringEncoding, NULL, GSUniTerminate))
-    {
-      NSLog(@"Conversion failed for %@", 
-            [NSString stringWithCharacters: ustr length: length]);
-      return;
-    }
+  _utf8_for_NSGlyphs(glyphs, length, str);
 
   cdata = malloc(sizeof(char) * 4 * ix * iy);
   if (!cdata)
@@ -527,40 +632,35 @@ BOOL _cairo_extents_for_NSGlyph(cairo_scaled_font_t *scaled_font, NSGlyph glyph,
              length: (int)length 
                  on: (cairo_t*)ct
 {
-  unichar ustr[length+1];
-  char str[3*length+1];
-  unsigned char *b;
-  int i;
-  unsigned int size = 3*length+1;
+  char str[4*length+1];
 
-  for (i = 0; i < length; i++)
-    {
-      ustr[i] = glyphs[i];
-    }
-  ustr[length] = 0;
+  int i = 0;
 
-  b = (unsigned char *)str;
-  if (!GSFromUnicode(&b, &size, ustr, length, 
-                     NSUTF8StringEncoding, NULL, GSUniTerminate))
+  while (i < length)
     {
-      NSLog(@"Conversion failed for %@", 
-            [NSString stringWithCharacters: ustr length: length]);
-      return;
-    }
+      cairo_scaled_font_t *sf = [self _scaledForGlyph: glyphs[i]];
+      int j = i + 1;
 
-  cairo_set_scaled_font(ct, _scaled);
-  if (cairo_status(ct) != CAIRO_STATUS_SUCCESS)
-    {
-      NSLog(@"Error while setting scaled font: %s", 
-            cairo_status_to_string(cairo_status(ct)));
-      return;
-    }
+      while (j < length && [self _scaledForGlyph: glyphs[j]] == sf)
+        j++;
 
-  cairo_show_text(ct, str);
-  if (cairo_status(ct) != CAIRO_STATUS_SUCCESS)
-    {
-      NSLog(@"Error drawing string: '%s' for string %s", 
-            cairo_status_to_string(cairo_status(ct)), str);
+      _utf8_for_NSGlyphs(glyphs + i, j - i, str);
+
+      cairo_set_scaled_font(ct, sf);
+      if (cairo_status(ct) != CAIRO_STATUS_SUCCESS)
+        {
+          NSLog(@"Error while setting scaled font: %s", 
+                cairo_status_to_string(cairo_status(ct)));
+          return;
+        }
+
+      cairo_show_text(ct, str);
+      if (cairo_status(ct) != CAIRO_STATUS_SUCCESS)
+        {
+          NSLog(@"Error drawing string: '%s' for string %s", 
+                cairo_status_to_string(cairo_status(ct)), str);
+        }
+      i = j;
     }
 }
 

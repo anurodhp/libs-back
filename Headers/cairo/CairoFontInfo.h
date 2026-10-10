@@ -36,6 +36,10 @@
 {
 @public
 	cairo_scaled_font_t *_scaled;
+	/* Fallback faces for glyphs (code points) this font lacks; lazily built.
+	   A fallback face itself never falls back. */
+	NSMutableArray *_fallbacks;
+	BOOL _isFallback;
 }
 
 - (void) drawGlyphs: (const NSGlyph*)glyphs

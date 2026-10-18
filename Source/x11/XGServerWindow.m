@@ -2232,6 +2232,18 @@ _get_next_prop_new_event(Display *display, XEvent *event, char *arg)
   [self styleoffsets: l : r : t : b : style : (Window) 0];
 }
 
+/* gnustep-gui's per-window offsets (GSDisplayServer): this window's own
+ * _NET_FRAME_EXTENTS, which the window manager zeroes for a full-screen
+ * window, before the per-style guess. */
+- (void) styleoffsets: (float *) l : (float *) r : (float *) t : (float *) b
+		     : (unsigned int) style forWindow: (int) win
+{
+  gswindow_device_t *window = WINDOW_WITH_TAG(win);
+
+  [self styleoffsets: l : r : t : b : style
+		    : window != NULL ? window->ident : (Window) 0];
+}
+
 - (void) styleoffsets: (float *) l : (float *) r : (float *) t : (float *) b
 		     : (unsigned int) style : (Window) win
 {
